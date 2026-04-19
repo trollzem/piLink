@@ -1,0 +1,4 @@
+module PiDisplayBridge {
+    header "PiDisplayBridge.h"
+    export *
+}

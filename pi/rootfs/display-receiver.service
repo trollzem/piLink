@@ -1,0 +1,17 @@
+[Unit]
+Description=Mac-to-Pi display receiver (gstreamer HW pipeline, RTP/UDP)
+After=multi-user.target usb-gadget.service
+Wants=usb-gadget.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/display-receiver.sh
+Restart=always
+RestartSec=1
+Nice=-5
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Pipeline latency echo server
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/latency-echo.py
+Restart=always
+RestartSec=1
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

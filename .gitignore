@@ -1,0 +1,5 @@
+mac/.build/
+mac/*.xcodeproj/
+mac/.swiftpm/
+*.log
+*.tmp
