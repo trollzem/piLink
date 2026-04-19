@@ -27,8 +27,21 @@ do {
 }
 
 // Set up the encoder + streamer pipeline
+let useUSB = CommandLine.arguments.contains("--usb")
+
 let encoder = Encoder(width: width, height: height)
-let streamer = RTPStreamer(host: piHost, port: piPort)
+
+protocol SampleStreamer: AnyObject {
+    func start()
+    func stop()
+    func send(_ sampleBuffer: CMSampleBuffer)
+}
+extension RTPStreamer: SampleStreamer {}
+extension USBBulkStreamer: SampleStreamer {}
+
+let streamer: SampleStreamer = useUSB
+    ? USBBulkStreamer()
+    : RTPStreamer(host: piHost, port: piPort)
 
 do {
     try encoder.start(bitrate: bitrate, fps: fps, maxKeyframeInterval: keyframeInterval)

@@ -51,6 +51,10 @@
 #define V4L2_DEV "/dev/video10"
 #define DRM_DEV  "/dev/dri/card0"
 
+/* When started with `--usb`, pidisplay reads length-prefixed NALs from this
+ * FunctionFS bulk-OUT endpoint. ffs-init handles descriptor write + UDC bind. */
+#define FFS_EP1  "/dev/ffs/pidisplay/ep1"
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
 
@@ -356,7 +360,14 @@ static int dec_setup_capture(struct decoder *d) {
 }
 
 static int dec_queue_bitstream(struct decoder *d, const uint8_t *data, size_t len) {
-    /* Dequeue any done OUTPUT buffer to reuse, else find a free one on first call. */
+    /* Only queue a buffer that is known-free:
+     *   - Initially we own all NUM_OUTPUT_BUF buffers (decoder hasn't used any).
+     *   - After first use, a buffer becomes free via DQBUF. Until that happens
+     *     we never reissue the same buffer twice (that's an EINVAL).
+     *   - If no buffer is free, drop the frame — real-time streaming is fine
+     *     losing a frame rather than letting the input queue balloon. */
+    static int initial_free = NUM_OUTPUT_BUF;  /* count of buffers never queued yet */
+
     struct v4l2_buffer b = {0};
     struct v4l2_plane planes[1] = {0};
     b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -364,14 +375,14 @@ static int dec_queue_bitstream(struct decoder *d, const uint8_t *data, size_t le
     b.length = 1;
     b.m.planes = planes;
 
-    int idx = -1;
+    int idx;
     if (xioctl(d->fd, VIDIOC_DQBUF, &b) == 0) {
         idx = b.index;
+    } else if (initial_free > 0) {
+        idx = NUM_OUTPUT_BUF - initial_free;
+        initial_free--;
     } else {
-        /* First N calls before any dequeue returns: cycle through. */
-        static int next_idx = 0;
-        idx = next_idx;
-        next_idx = (next_idx + 1) % NUM_OUTPUT_BUF;
+        return -1;   /* no buffer free; drop */
     }
 
     if (len > d->out[idx].mmap_size) {
@@ -389,6 +400,8 @@ static int dec_queue_bitstream(struct decoder *d, const uint8_t *data, size_t le
     q.m.planes = qplanes;
     qplanes[0].bytesused = len;
     if (xioctl(d->fd, VIDIOC_QBUF, &q) < 0) {
+        /* Rare — but if it fails, we have lost track of the buffer. Count it
+         * as "initially free" so we retry. */
         info("QBUF OUTPUT %d: %s", idx, strerror(errno));
         return -1;
     }
@@ -685,7 +698,94 @@ static void handle_decoder(struct app *a) {
     dec_requeue_capture(&a->dec, idx);
 }
 
-int main(void) {
+/* USB bulk input accumulator. Non-blocking reads into `g_uin.data` and parses
+ * length-prefixed NALs as they become complete. Keeping read() non-blocking is
+ * essential — otherwise a partial NAL arrival stalls the poll loop and the
+ * V4L2 capture queue overflows. */
+static struct {
+    uint8_t *data;
+    size_t cap;
+    size_t used;
+} g_uin;
+
+static int usb_pump(struct app *a, int ep1) {
+    if (!g_uin.data) {
+        g_uin.cap  = 4 * 1024 * 1024;
+        g_uin.data = malloc(g_uin.cap);
+        if (!g_uin.data) die("malloc input buffer");
+    }
+
+    /* Drain everything currently available without blocking. Transient errors
+     * (USB host resets on libusb claim, etc.) are logged but not fatal. */
+    for (;;) {
+        if (g_uin.used >= g_uin.cap) break;
+        ssize_t n = read(ep1, g_uin.data + g_uin.used, g_uin.cap - g_uin.used);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR || errno == 0) break;
+            static uint64_t last_err_log;
+            uint64_t tt = now_ms();
+            if (tt - last_err_log > 1000) {
+                info("ep1 read transient: errno=%d (%s)", errno, strerror(errno));
+                last_err_log = tt;
+            }
+            break;  /* keep pidisplay alive; try again next poll */
+        }
+        if (n == 0) break;
+        g_uin.used += n;
+    }
+
+    static bool logged_first = false;
+    if (!logged_first && g_uin.used >= 16) {
+        logged_first = true;
+        info("first 32 bytes: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x ...",
+             g_uin.data[0], g_uin.data[1], g_uin.data[2], g_uin.data[3],
+             g_uin.data[4], g_uin.data[5], g_uin.data[6], g_uin.data[7],
+             g_uin.data[8], g_uin.data[9], g_uin.data[10], g_uin.data[11],
+             g_uin.data[12], g_uin.data[13], g_uin.data[14], g_uin.data[15]);
+    }
+
+    /* Parse at most a frame's worth of NALs per pump call so the decoder
+     * dequeue path gets serviced between bursts. */
+    size_t off = 0;
+    int nals_this_pump = 0;
+    while (g_uin.used - off >= 4 && nals_this_pump < 8) {
+        uint32_t len_be;
+        memcpy(&len_be, g_uin.data + off, 4);
+        uint32_t len = ntohl(len_be);
+        if (len == 0 || len > MAX_NAL_SIZE - 4) {
+            info("invalid NAL length %u, dropping %zu-byte buffer", len, g_uin.used - off);
+            off = g_uin.used;
+            break;
+        }
+        if (g_uin.used - off < 4 + (size_t)len) break;   /* incomplete; wait for more */
+
+        /* Wrap in Annex-B (4-byte start code) and hand to V4L2. */
+        a->dep.nal[0] = 0; a->dep.nal[1] = 0; a->dep.nal[2] = 0; a->dep.nal[3] = 1;
+        memcpy(a->dep.nal + 4, g_uin.data + off + 4, len);
+        a->frames_in++;
+        dec_queue_bitstream(&a->dec, a->dep.nal, (size_t)len + 4);
+
+        off += 4 + len;
+        nals_this_pump++;
+    }
+
+    if (off > 0) {
+        if (g_uin.used - off > 0)
+            memmove(g_uin.data, g_uin.data + off, g_uin.used - off);
+        g_uin.used -= off;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    setlinebuf(stderr);
+    bool use_usb = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--usb") == 0) use_usb = true;
+        else if (strcmp(argv[i], "--udp") == 0) use_usb = false;
+        else { fprintf(stderr, "usage: %s [--udp|--usb]\n", argv[0]); return 1; }
+    }
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
@@ -695,19 +795,27 @@ int main(void) {
     a.dep.nal = malloc(MAX_NAL_SIZE);
     if (!a.dep.nal) die("malloc");
 
-    /* UDP socket on :5001, large kernel recv buffer. */
-    a.udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (a.udp_fd < 0) die("socket");
-    int on = 1;
-    setsockopt(a.udp_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    int rcvbuf = 4 * 1024 * 1024;
-    setsockopt(a.udp_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(UDP_PORT);
-    if (bind(a.udp_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) die("bind");
-    info("listening on udp/%d", UDP_PORT);
+    int input_fd;
+    if (use_usb) {
+        /* O_NONBLOCK so reads never stall the main poll loop. */
+        input_fd = open(FFS_EP1, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (input_fd < 0) die("open %s", FFS_EP1);
+        info("reading bulk NALs from %s (nonblocking)", FFS_EP1);
+    } else {
+        input_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (input_fd < 0) die("socket");
+        int on = 1;
+        setsockopt(input_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        int rcvbuf = 4 * 1024 * 1024;
+        setsockopt(input_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons(UDP_PORT);
+        if (bind(input_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) die("bind");
+        info("listening on udp/%d", UDP_PORT);
+    }
+    a.udp_fd = input_fd;  /* repurposed: generic input fd */
 
     dec_open(&a.dec);
     disp_open(&a.disp);
@@ -718,25 +826,26 @@ int main(void) {
     struct pollfd pfds[2];
 
     while (!g_stop) {
-        pfds[0].fd = a.udp_fd;
+        pfds[0].fd = input_fd;
         pfds[0].events = POLLIN;
         pfds[1].fd = a.dec.fd;
-        pfds[1].events = POLLIN | POLLPRI;  /* POLLIN=decoded frame, PRI=events */
+        pfds[1].events = POLLIN | POLLPRI;
         int r = poll(pfds, 2, 1000);
         if (r < 0 && errno != EINTR) { info("poll: %s", strerror(errno)); break; }
 
-        /* UDP: drain available packets. */
         if (pfds[0].revents & POLLIN) {
-            for (;;) {
-                ssize_t n = recv(a.udp_fd, pkt, sizeof(pkt), 0);
-                if (n < 0) break;
-                depay_feed(&a.dep, pkt, (size_t)n, on_au, &a);
+            if (use_usb) {
+                if (usb_pump(&a, input_fd) < 0) break;
+            } else {
+                for (;;) {
+                    ssize_t n = recv(input_fd, pkt, sizeof(pkt), MSG_DONTWAIT);
+                    if (n < 0) break;
+                    depay_feed(&a.dep, pkt, (size_t)n, on_au, &a);
+                }
             }
         }
-        /* Decoder: events + decoded frames. */
         if (pfds[1].revents) handle_decoder(&a);
 
-        /* Stats once a second. */
         uint64_t t = now_ms();
         if (t - a.t_last_stats >= 1000) {
             info("in=%llu out=%llu (%.1f ms period)",
@@ -749,12 +858,11 @@ int main(void) {
     }
 
     info("shutting down");
-    /* Best-effort cleanup; kernel cleans the rest on exit. */
     if (a.dec.capture_streaming) {
         int t = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         xioctl(a.dec.fd, VIDIOC_STREAMOFF, &t);
     }
-    close(a.udp_fd);
+    close(input_fd);
     close(a.dec.fd);
     close(a.disp.fd);
     return 0;
