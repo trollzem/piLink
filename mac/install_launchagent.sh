@@ -95,15 +95,10 @@ launchctl bootout "gui/$(id -u)/${BUNDLE_ID}" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "${PLIST}"
 launchctl enable "gui/$(id -u)/${BUNDLE_ID}"
 
-# On first install we want a clean TCC slate; on subsequent rebuilds we keep
-# the existing approval so the user doesn't have to click through System
-# Settings every time. Decide by whether Screen Recording is already granted.
-if ! sqlite3 /dev/null 2>/dev/null; then : ; fi
-_has_sr=$(sqlite3 "${HOME}/Library/Application Support/com.apple.TCC/TCC.db" \
-    "select allowed from access where service='kTCCServiceScreenCapture' and client='${BUNDLE_ID}' and allowed=1" 2>/dev/null | head -1)
-if [ -z "${_has_sr}" ]; then
-    tccutil reset ScreenCapture "${BUNDLE_ID}" 2>/dev/null || true
-fi
+# NOTE: we intentionally do NOT call `tccutil reset ScreenCapture` here.
+# The TCC database is SIP-protected so we can't tell from userspace whether
+# we already have approval. Resetting every run forces the user to re-toggle
+# in System Settings and is worse than stale-denial edge cases.
 
 launchctl kickstart -k "gui/$(id -u)/${BUNDLE_ID}"
 
