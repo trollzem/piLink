@@ -471,19 +471,27 @@ static int disp_open(struct display *d) {
     }
     if (!conn) die("no connected connector");
     d->connector_id = conn->connector_id;
-    /* Prefer a 1920x1080@60 mode if the monitor supports it — the Mac encodes
-     * 1920x1080 16:9, and matching the CRTC mode means no stretch/letterbox.
-     * Fall back to the monitor's preferred mode otherwise. */
+    /* Prefer a 1920x1080@60 progressive mode if the monitor has one — it
+     * matches our H.264 source aspect (16:9), and on panels whose native
+     * resolution exceeds what the Pi Zero 2 W HDMI pixel clock can drive
+     * (e.g. any QHD/4K panel), sending 1080p lets the monitor do a clean
+     * uniform upscale with no letterboxing. Falls back to the monitor's
+     * preferred mode when no 1080p60p is advertised. */
     int chosen = 0;
     for (int i = 0; i < conn->count_modes; i++) {
         drmModeModeInfo *m = &conn->modes[i];
-        if (m->hdisplay == 1920 && m->vdisplay == 1080 && m->vrefresh >= 59) {
+        if (m->hdisplay == 1920 && m->vdisplay == 1080 &&
+            m->vrefresh >= 59 && !(m->flags & DRM_MODE_FLAG_INTERLACE)) {
             chosen = i; break;
         }
     }
     d->mode = conn->modes[chosen];
     d->screen_w = d->mode.hdisplay;
     d->screen_h = d->mode.vdisplay;
+    /* Remember we need to push the modeset to the CRTC too. disp_configure
+     * installs a 1-pixel black primary FB and changes the mode; that hides
+     * the kernel-console primary plane (so no leftover terminal text shows
+     * in the margins if our overlay is smaller than the screen). */
     info("drm: connector %u mode %dx%d@%uHz", d->connector_id,
          d->screen_w, d->screen_h, d->mode.vrefresh);
 
@@ -618,9 +626,48 @@ static void disp_set_dpms(struct display *dd, bool on) {
     info("HDMI DPMS %s", on ? "ON" : "OFF");
 }
 
+/* Install an all-black framebuffer at the mode's full size on the primary
+ * plane and drive the connector into our chosen mode. VC4 wants the primary
+ * FB to be the exact mode size; smaller buffers return ENOSPC. */
+static void disp_install_primary_black(struct display *dd) {
+    struct drm_mode_create_dumb cd = {0};
+    cd.width = dd->mode.hdisplay;
+    cd.height = dd->mode.vdisplay;
+    cd.bpp = 32;
+    if (drmIoctl(dd->fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
+        info("CREATE_DUMB: %s", strerror(errno));
+        return;
+    }
+    uint32_t fb_id;
+    if (drmModeAddFB(dd->fd, dd->mode.hdisplay, dd->mode.vdisplay,
+                     24, 32, cd.pitch, cd.handle, &fb_id) < 0) {
+        info("AddFB black: %s", strerror(errno));
+        return;
+    }
+    /* Map + zero. */
+    struct drm_mode_map_dumb md = { .handle = cd.handle };
+    if (drmIoctl(dd->fd, DRM_IOCTL_MODE_MAP_DUMB, &md) == 0) {
+        void *p = mmap(0, cd.size, PROT_READ|PROT_WRITE, MAP_SHARED, dd->fd, md.offset);
+        if (p != MAP_FAILED) {
+            memset(p, 0, cd.size);
+            munmap(p, cd.size);
+        }
+    }
+    /* Apply modeset with our chosen mode — this covers the primary with black. */
+    uint32_t connector = dd->connector_id;
+    if (drmModeSetCrtc(dd->fd, dd->crtc_id, fb_id, 0, 0,
+                       &connector, 1, &dd->mode) < 0) {
+        info("SetCrtc: %s", strerror(errno));
+    } else {
+        info("drm: CRTC set to %dx%d@%uHz, primary=black",
+             dd->mode.hdisplay, dd->mode.vdisplay, dd->mode.vrefresh);
+    }
+}
+
 /* One-time setup of the CRTC/connector. We just kick the plane to the right
  * destination rect for each frame via atomic commit in disp_show(). */
 static void disp_configure(struct display *dd) {
+    disp_install_primary_black(dd);
     int fb_prop = prop_id(dd->fd, dd->plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID");
     int crtc_prop = prop_id(dd->fd, dd->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
     if (fb_prop < 0 || crtc_prop < 0) die("plane props missing");
