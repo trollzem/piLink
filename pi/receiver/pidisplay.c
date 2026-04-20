@@ -440,6 +440,10 @@ struct display {
     int _crtc_prop;
     int _src_x, _src_y, _src_w, _src_h;
     int _crtc_x, _crtc_y, _crtc_w, _crtc_h;
+    /* Connector DPMS — used to put the HDMI output into standby when the
+     * stream goes idle, and bring it back when frames resume. */
+    uint32_t _dpms_prop;
+    bool     dpms_on;
 };
 
 static uint32_t v4l2_to_drm_fourcc(uint32_t v) {
@@ -591,6 +595,19 @@ static int prop_id(int fd, uint32_t obj_id, uint32_t obj_type, const char *name)
     return id;
 }
 
+/* Flip HDMI DPMS. on=true drives the signal out; false puts the connected
+ * monitor into standby (backlight off). */
+static void disp_set_dpms(struct display *dd, bool on) {
+    if (!dd->_dpms_prop || dd->dpms_on == on) return;
+    uint64_t v = on ? 0 /* DRM_MODE_DPMS_ON */ : 3 /* DRM_MODE_DPMS_OFF */;
+    if (drmModeConnectorSetProperty(dd->fd, dd->connector_id, dd->_dpms_prop, v) < 0) {
+        info("SetProperty DPMS %s: %s", on ? "ON" : "OFF", strerror(errno));
+        return;
+    }
+    dd->dpms_on = on;
+    info("HDMI DPMS %s", on ? "ON" : "OFF");
+}
+
 /* One-time setup of the CRTC/connector. We just kick the plane to the right
  * destination rect for each frame via atomic commit in disp_show(). */
 static void disp_configure(struct display *dd) {
@@ -608,6 +625,12 @@ static void disp_configure(struct display *dd) {
     dd->_crtc_y = prop_id(dd->fd, dd->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
     dd->_crtc_w = prop_id(dd->fd, dd->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_W");
     dd->_crtc_h = prop_id(dd->fd, dd->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+
+    /* Look up the connector's DPMS property so we can idle the HDMI output. */
+    int pid = prop_id(dd->fd, dd->connector_id, DRM_MODE_OBJECT_CONNECTOR, "DPMS");
+    dd->_dpms_prop = pid > 0 ? (uint32_t)pid : 0;
+    dd->dpms_on = true;  /* assume kernel left it on after modeset */
+    if (!dd->_dpms_prop) info("warn: DPMS property not found on connector");
 }
 
 /* Display a framebuffer on our plane, scaled to full screen. Uses the legacy
@@ -633,6 +656,7 @@ struct app {
     uint64_t frames_in;
     uint64_t frames_out;
     uint64_t t_last_stats;
+    uint64_t t_last_display; /* ms of last successful disp_show */
 };
 
 static uint64_t now_ms(void) {
@@ -671,8 +695,12 @@ static void handle_decoder(struct app *a) {
     struct v4l2_buf *vb = &a->dec.cap[idx];
     if (disp_ensure_fb(&a->disp, vb, a->dec.cap_width, a->dec.cap_height,
                        a->dec.cap_fourcc) == 0) {
+        /* Waking up the HDMI signal before the flip so the first post-idle
+         * frame is visible immediately. */
+        if (!a->disp.dpms_on) disp_set_dpms(&a->disp, true);
         if (disp_show(&a->disp, vb->drm_fb_id,
                       a->dec.visible_width, a->dec.visible_height) == 0) {
+            a->t_last_display = now_ms();
             /* Re-queue the previously-displayed buffer so the decoder can reuse. */
             if (a->current_cap_idx >= 0 && a->current_cap_idx != idx) {
                 dec_requeue_capture(&a->dec, a->current_cap_idx);
@@ -738,6 +766,14 @@ int main(void) {
 
         /* Stats once a second. */
         uint64_t t = now_ms();
+
+        /* Auto-idle: if no frame has been shown for a while, drop the HDMI
+         * signal so the connected monitor enters DPMS standby. The next frame
+         * that arrives will bring it back (see handle_decoder). */
+        if (a.disp.dpms_on && a.t_last_display != 0 && t - a.t_last_display > 3000) {
+            disp_set_dpms(&a.disp, false);
+        }
+
         if (t - a.t_last_stats >= 1000) {
             info("in=%llu out=%llu (%.1f ms period)",
                  (unsigned long long)a.frames_in,

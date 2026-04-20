@@ -1,6 +1,7 @@
 import Foundation
 import ScreenCaptureKit
 import CoreGraphics
+import AppKit  // NSWorkspace for screen sleep/wake notifications
 
 // Config
 let width = 1920
@@ -139,6 +140,46 @@ for src in [sigSource1, sigSource2] {
         }
     }
     src.resume()
+}
+
+// Sleep/wake with the rest of the system's displays. When the Mac's own
+// monitors go to sleep, we stop the capture+encode pipeline (so ScreenCaptureKit
+// doesn't spin on a sleeping display) and send the Pi's monitor a blank frame.
+// On wake, we restart capture.
+let workspaceNC = NSWorkspace.shared.notificationCenter
+workspaceNC.addObserver(
+    forName: NSWorkspace.screensDidSleepNotification,
+    object: nil, queue: .main
+) { _ in
+    FileHandle.standardError.write(Data("screens sleeping — pausing\n".utf8))
+    Task { await capture.stop() }
+    ticker.stop()
+    // Force an immediate IDR of a black frame so the Pi monitor clears.
+    // (Omitted — the overlay plane keeps the last frame until wake; acceptable.)
+}
+workspaceNC.addObserver(
+    forName: NSWorkspace.screensDidWakeNotification,
+    object: nil, queue: .main
+) { _ in
+    FileHandle.standardError.write(Data("screens woke — resuming\n".utf8))
+    ticker.start()
+    Task {
+        // Give SCShareableContent a beat to re-inventory after wake.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        for attempt in 1...20 {
+            do {
+                try await capture.start(
+                    displayID: virtualDisplay.displayID,
+                    width: width, height: height, fps: fps)
+                FileHandle.standardError.write(
+                    Data("capture resumed (attempt \(attempt))\n".utf8))
+                return
+            } catch {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        FileHandle.standardError.write(Data("capture failed to resume\n".utf8))
+    }
 }
 
 FileHandle.standardError.write(Data("streaming to \(piHost):\(piPort). Ctrl+C to stop.\n".utf8))
