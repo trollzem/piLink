@@ -471,7 +471,17 @@ static int disp_open(struct display *d) {
     }
     if (!conn) die("no connected connector");
     d->connector_id = conn->connector_id;
-    d->mode = conn->modes[0];  /* first is preferred */
+    /* Prefer a 1920x1080@60 mode if the monitor supports it — the Mac encodes
+     * 1920x1080 16:9, and matching the CRTC mode means no stretch/letterbox.
+     * Fall back to the monitor's preferred mode otherwise. */
+    int chosen = 0;
+    for (int i = 0; i < conn->count_modes; i++) {
+        drmModeModeInfo *m = &conn->modes[i];
+        if (m->hdisplay == 1920 && m->vdisplay == 1080 && m->vrefresh >= 59) {
+            chosen = i; break;
+        }
+    }
+    d->mode = conn->modes[chosen];
     d->screen_w = d->mode.hdisplay;
     d->screen_h = d->mode.vdisplay;
     info("drm: connector %u mode %dx%d@%uHz", d->connector_id,
