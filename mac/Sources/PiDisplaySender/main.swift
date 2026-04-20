@@ -142,45 +142,56 @@ for src in [sigSource1, sigSource2] {
     src.resume()
 }
 
-// Sleep/wake with the rest of the system's displays. When the Mac's own
-// monitors go to sleep, we stop the capture+encode pipeline (so ScreenCaptureKit
-// doesn't spin on a sleeping display) and send the Pi's monitor a blank frame.
-// On wake, we restart capture.
-let workspaceNC = NSWorkspace.shared.notificationCenter
-workspaceNC.addObserver(
-    forName: NSWorkspace.screensDidSleepNotification,
-    object: nil, queue: .main
-) { _ in
-    FileHandle.standardError.write(Data("screens sleeping — pausing\n".utf8))
-    Task { await capture.stop() }
-    ticker.stop()
-    // Force an immediate IDR of a black frame so the Pi monitor clears.
-    // (Omitted — the overlay plane keeps the last frame until wake; acceptable.)
-}
-workspaceNC.addObserver(
-    forName: NSWorkspace.screensDidWakeNotification,
-    object: nil, queue: .main
-) { _ in
-    FileHandle.standardError.write(Data("screens woke — resuming\n".utf8))
-    ticker.start()
-    Task {
-        // Give SCShareableContent a beat to re-inventory after wake.
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        for attempt in 1...20 {
-            do {
-                try await capture.start(
-                    displayID: virtualDisplay.displayID,
-                    width: width, height: height, fps: fps)
-                FileHandle.standardError.write(
-                    Data("capture resumed (attempt \(attempt))\n".utf8))
-                return
-            } catch {
-                try? await Task.sleep(nanoseconds: 500_000_000)
+// Sleep/wake with the rest of the system's displays. NSWorkspace
+// notifications aren't reliable for LaunchAgent-launched apps, so we poll
+// the real-deal CG display state once a second. Cheap, bulletproof.
+//
+// When the Mac's own monitors sleep: stop capture + ticker so we aren't
+// feeding the Pi decoder (which then idles and DPMS-offs its HDMI).
+// When they wake: restart the ticker and re-open the SCStream. On first
+// wake the virtual display's ID usually doesn't change; if capture fails
+// repeatedly we recreate the virtual display from scratch.
+var sleeping = false
+let sleepWatcherQueue = DispatchQueue(label: "pidisplay.sleep", qos: .utility)
+let sleepTimer = DispatchSource.makeTimerSource(queue: sleepWatcherQueue)
+sleepTimer.schedule(deadline: .now() + 1, repeating: 1.0)
+sleepTimer.setEventHandler {
+    let asleep = CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    if asleep && !sleeping {
+        sleeping = true
+        FileHandle.standardError.write(Data("main display asleep — pausing\n".utf8))
+        ticker.stop()
+        Task { await capture.stop() }
+    } else if !asleep && sleeping {
+        sleeping = false
+        FileHandle.standardError.write(Data("main display awake — resuming\n".utf8))
+        ticker.start()
+        Task {
+            // Give the SC framework a beat after wake to re-inventory displays.
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            for attempt in 1...20 {
+                do {
+                    try await capture.start(
+                        displayID: virtualDisplay.displayID,
+                        width: width, height: height, fps: fps)
+                    FileHandle.standardError.write(
+                        Data("capture resumed (attempt \(attempt))\n".utf8))
+                    return
+                } catch {
+                    if attempt % 4 == 0 {
+                        FileHandle.standardError.write(
+                            Data("resume attempt \(attempt) failed: \(error)\n".utf8))
+                    }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
             }
+            FileHandle.standardError.write(
+                Data("capture failed to resume; exiting so launchd restarts us\n".utf8))
+            exit(2)
         }
-        FileHandle.standardError.write(Data("capture failed to resume\n".utf8))
     }
 }
+sleepTimer.resume()
 
 FileHandle.standardError.write(Data("streaming to \(piHost):\(piPort). Ctrl+C to stop.\n".utf8))
 dispatchMain()
